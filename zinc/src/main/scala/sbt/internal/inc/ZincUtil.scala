@@ -12,10 +12,8 @@
 package sbt.internal.inc
 
 import java.io.File
-import java.net.URLClassLoader
 
 import sbt.internal.inc.javac.JavaTools
-import sbt.internal.inc.classpath.ClassLoaderCache
 import xsbti.compile.{ JavaTools => XJavaTools, _ }
 
 /** Define a private implementation of the static methods forwarded from `ZincCompilerUtil`. */
@@ -44,7 +42,7 @@ object ZincUtil {
       classpathOptions: ClasspathOptions
   ): AnalyzingCompiler = {
     val bridgeProvider = constantBridgeProvider(scalaInstance, compilerBridgeJar)
-    val loader = Some(new ClassLoaderCache(new URLClassLoader(Array())))
+    val loader = None
     new AnalyzingCompiler(scalaInstance, bridgeProvider, classpathOptions, _ => (), loader)
   }
 

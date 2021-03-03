@@ -111,16 +111,34 @@ final class AnalyzingCompiler(
       compiler: CachedCompiler
   ): Unit = {
     onArgsHandler(compiler.commandArguments(sources))
-    call("xsbt.CompilerInterface", "run", log)(
-      classOf[Array[File]],
-      classOf[DependencyChanges],
-      classOf[AnalysisCallback],
-      classOf[xLogger],
-      classOf[Reporter],
-      classOf[CompileProgress],
-      classOf[CachedCompiler]
-    )(sources, changes, callback, log, reporter, progress, compiler)
-    ()
+    // hold reference to compiler bridge class loader to prevent its being evicted
+    // from the compiler cache (sbt/zinc#914)
+    val loader = getLoader(log)
+    try {
+      call("xsbt.CompilerInterface", "run", loader)(
+        classOf[Array[File]],
+        classOf[DependencyChanges],
+        classOf[AnalysisCallback],
+        classOf[xLogger],
+        classOf[Reporter],
+        classOf[CompileProgress],
+        classOf[CachedCompiler]
+      )(sources, changes, callback, log, reporter, progress, compiler)
+      ()
+    } finally {
+      try {
+        System.err.println("DEBUG::: compile()")
+        System.err.println("loader: " + loader.toString)
+        val df = loader.getClass.getDeclaredField("ucp")
+        df.setAccessible(true)
+        val ucp = df.get(loader)
+        val df2 = ucp.getClass.getDeclaredField("closed")
+        df2.setAccessible(true)
+        System.err.println("loader ucp.cosed: " + df2.get(ucp))
+      } catch {
+        case t: Throwable => t.printStackTrace()
+      }
+    }
   }
 
   def newCachedCompiler(
@@ -137,13 +155,25 @@ final class AnalyzingCompiler(
       log: xLogger,
       reporter: Reporter
   ): CachedCompiler = {
-    val compiler = call("xsbt.CompilerInterface", "newCompiler", log)(
-      classOf[Array[String]],
-      classOf[Output],
-      classOf[xLogger],
-      classOf[Reporter]
-    )(arguments.toArray[String], output, log, reporter)
-    compiler.asInstanceOf[CachedCompiler]
+    // hold reference to compiler bridge class loader to prevent its being evicted
+    // from the compiler cache (sbt/zinc#914)
+    val loader = getLoader(log)
+    try {
+      val compiler = call("xsbt.CompilerInterface", "newCompiler", loader)(
+        classOf[Array[String]],
+        classOf[Output],
+        classOf[xLogger],
+        classOf[Reporter]
+      )(arguments.toArray[String], output, log, reporter)
+      compiler.asInstanceOf[CachedCompiler]
+    } finally {
+      try {
+        System.err.println("DEBUG::: newCachedCompiler()")
+        System.err.println("loader: " + loader.toString)
+      } catch {
+        case t: Throwable => t.printStackTrace()
+      }
+    }
   }
 
   def doc(
@@ -170,7 +200,10 @@ final class AnalyzingCompiler(
     val arguments =
       compArgs(sources, classpath, Some(outputDirectory), options)
     onArgsHandler(arguments)
-    call("xsbt.ScaladocInterface", "run", log)(
+    // hold reference to compiler bridge class loader to prevent its being evicted
+    // from the compiler cache (sbt/zinc#914)
+    val loader = getLoader(log)
+    call("xsbt.ScaladocInterface", "run", loader)(
       classOf[Array[String]],
       classOf[xLogger],
       classOf[Reporter]
@@ -188,7 +221,10 @@ final class AnalyzingCompiler(
     onArgsHandler(consoleCommandArguments(classpath, options, log))
     val (classpathString, bootClasspath) = consoleClasspaths(classpath)
     val (names, values) = bindings.unzip
-    call("xsbt.ConsoleInterface", "run", log)(
+    // hold reference to compiler bridge class loader to prevent its being evicted
+    // from the compiler cache (sbt/zinc#914)
+    val loader = getLoader(log)
+    call("xsbt.ConsoleInterface", "run", loader)(
       classOf[Array[String]],
       classOf[String],
       classOf[String],
@@ -204,7 +240,7 @@ final class AnalyzingCompiler(
       classpathString,
       initialCommands,
       cleanupCommands,
-      loader.orNull,
+      loader,
       names.toArray[String],
       values.toArray[Any],
       log
@@ -226,7 +262,10 @@ final class AnalyzingCompiler(
       log: Logger
   ): Seq[String] = {
     val (classpathString, bootClasspath) = consoleClasspaths(classpath)
-    val argsObj = call("xsbt.ConsoleInterface", "commandArguments", log)(
+    // hold reference to compiler bridge class loader to prevent its being evicted
+    // from the compiler cache (sbt/zinc#914)
+    val loader = getLoader(log)
+    val argsObj = call("xsbt.ConsoleInterface", "commandArguments", loader)(
       classOf[Array[String]],
       classOf[String],
       classOf[String],
@@ -240,29 +279,39 @@ final class AnalyzingCompiler(
   private def call(
       interfaceClassName: String,
       methodName: String,
-      log: Logger
+      loader: ClassLoader
   )(argTypes: Class[_]*)(args: AnyRef*): AnyRef = {
-    val interfaceClass = getInterfaceClass(interfaceClassName, log)
+    val interfaceClass = getInterfaceClass(interfaceClassName, loader)
     val interface = interfaceClass.getDeclaredConstructor().newInstance().asInstanceOf[AnyRef]
     val method = interfaceClass.getMethod(methodName, argTypes: _*)
     try method.invoke(interface, args: _*)
     catch {
-      case e: InvocationTargetException =>
+      case e: InvocationTargetException => {
+        System.err.println("DEBUG::: call() - InvocationTargetException")
+        e.printStackTrace()
         e.getCause match {
           case c: xsbti.CompileFailed =>
             throw new CompileFailed(c.arguments, c.toString, c.problems)
           case t => throw t
         }
+      }
     }
   }
 
-  private[this] def loader(log: Logger) = {
+  private[this] def getLoader(log: Logger): ClassLoader = {
     val interfaceJar = provider.fetchCompiledBridge(scalaInstance, log)
     def createInterfaceLoader =
       new URLClassLoader(
         Array(interfaceJar.toURI.toURL),
         createDualLoader(scalaInstance.loader(), getClass.getClassLoader)
       )
+
+    try {
+      System.err.println("DEBUG::: getLoader()")
+      System.err.println("classLoaderCache: " + classLoaderCache.toString)
+    } catch {
+      case t: Throwable => t.printStackTrace()
+    }
 
     classLoaderCache match {
       case Some(cache) =>
@@ -274,8 +323,8 @@ final class AnalyzingCompiler(
     }
   }
 
-  private[this] def getInterfaceClass(name: String, log: Logger) =
-    Class.forName(name, true, loader(log))
+  private[this] def getInterfaceClass(name: String, loader: ClassLoader) =
+    Class.forName(name, true, loader)
 
   protected def createDualLoader(
       scalaLoader: ClassLoader,
